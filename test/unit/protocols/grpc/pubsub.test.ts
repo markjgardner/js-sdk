@@ -162,6 +162,46 @@ describe("grpc/pubsub", () => {
       expect(res.failedMessages.length).toBe(2);
     });
 
+    // Dapr forwards unrecognised gRPC methods to service invocation rather than
+    // rejecting them with UNIMPLEMENTED, so a pre-1.17 sidecar surfaces the
+    // missing RPC as a proxy failure. See dapr/js-sdk#786.
+    it("should fall back when the sidecar reports the RPC as a proxy failure", async () => {
+      const alpha1Requests: any[] = [];
+      const grpcClientPubsub = new GRPCClientPubSub(
+        getMockClient(
+          async () => {
+            throw new ConnectError(
+              "failed to proxy request: required metadata dapr-callee-app-id or dapr-app-id not found",
+              Code.Unknown,
+            );
+          },
+          async (req) => {
+            alpha1Requests.push(req);
+            return { failedEntries: [] };
+          },
+        ),
+      );
+
+      const res = await grpcClientPubsub.publishBulk("my-pubsub", "my-topic", messages);
+
+      expect(res.failedMessages.length).toBe(0);
+      expect(alpha1Requests.length).toBe(1);
+    });
+
+    it("should not fall back on an unrelated Unknown error", async () => {
+      const alpha1 = jest.fn();
+      const grpcClientPubsub = new GRPCClientPubSub(
+        getMockClient(async () => {
+          throw new ConnectError("redis connection reset", Code.Unknown);
+        }, alpha1 as any),
+      );
+
+      const res = await grpcClientPubsub.publishBulk("my-pubsub", "my-topic", messages);
+
+      expect(alpha1).not.toHaveBeenCalled();
+      expect(res.failedMessages.length).toBe(2);
+    });
+
     it("should map failed entries returned by the stable API", async () => {
       const grpcClientPubsub = new GRPCClientPubSub(
         getMockClient(

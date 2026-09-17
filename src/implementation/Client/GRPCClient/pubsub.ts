@@ -32,6 +32,26 @@ import { PubSubBulkPublishMessage } from "../../../types/pubsub/PubSubBulkPublis
 import { PubSubPublishOptions } from "../../../types/pubsub/PubSubPublishOptions.type";
 
 /**
+ * Determines whether a gRPC error means the sidecar does not serve the stable
+ * `BulkPublishEvent` RPC.
+ *
+ * A sidecar that predates the RPC should answer `UNIMPLEMENTED`, but Dapr
+ * installs a catch-all handler that forwards unrecognised methods to service
+ * invocation, so in practice it reports a proxy failure with `UNKNOWN`
+ * instead. Both shapes are treated as "not supported"; the match is kept
+ * deliberately narrow, because a broader one risks retrying a publish that the
+ * sidecar had in fact already accepted.
+ */
+function isBulkPublishUnsupported(error: unknown): boolean {
+  const connectError = ConnectError.from(error);
+
+  return (
+    connectError.code === Code.Unimplemented ||
+    (connectError.code === Code.Unknown && connectError.rawMessage.includes("failed to proxy request"))
+  );
+}
+
+/**
  * gRPC-based pub/sub building block implementation.
  *
  * Provides publish and bulk publish operations for event-driven messaging patterns.
@@ -142,11 +162,11 @@ export default class GRPCClientPubSub implements IClientPubSub {
 
   /**
    * Invokes the stable `BulkPublishEvent` RPC, falling back to the deprecated
-   * `BulkPublishEventAlpha1` RPC when the sidecar does not implement it.
+   * `BulkPublishEventAlpha1` RPC when the sidecar does not serve it.
    *
-   * The stable RPC was introduced in Dapr 1.17. Older sidecars answer it with
-   * `UNIMPLEMENTED`, which is unambiguous, so the fallback is remembered for
-   * the lifetime of this client.
+   * The stable RPC was introduced in Dapr 1.17. Older sidecars reject it in a
+   * way that identifies the method as unknown rather than the publish as
+   * failed, so the fallback is remembered for the lifetime of this client.
    */
   private async bulkPublish(
     client: Awaited<ReturnType<GRPCClient["getClient"]>>,
@@ -159,7 +179,7 @@ export default class GRPCClientPubSub implements IClientPubSub {
     try {
       return await client.bulkPublishEvent(request);
     } catch (err) {
-      if (ConnectError.from(err).code !== Code.Unimplemented) {
+      if (!isBulkPublishUnsupported(err)) {
         throw err;
       }
 
