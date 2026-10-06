@@ -13,7 +13,9 @@ endpoint. Previously the SDK always called the alpha1 variants.
 This is not a breaking change. The method name, parameters, and return type are unchanged, and no consumer code
 needs to be updated. When the SDK detects a sidecar that does not serve the stable API it transparently retries
 against the deprecated `BulkPublishEventAlpha1` / `v1.0-alpha1` API and logs a warning suggesting an upgrade.
-The downgrade is remembered per client, so it costs at most one extra round trip.
+The downgrade is remembered per client, and bulk publishes that start while the first one is still in flight
+wait for its outcome rather than each probing the sidecar, so a pre-1.17 sidecar normally costs one extra round
+trip and one warning per client.
 
 Detecting an unsupported sidecar differs per transport. Over HTTP the sidecar answers `404`. Over gRPC it does
 _not_ answer `UNIMPLEMENTED` as you might expect: Dapr installs a catch-all handler that forwards unrecognised

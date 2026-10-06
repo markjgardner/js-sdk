@@ -24,15 +24,16 @@ import { PubSubPublishResponseType } from "../../../types/pubsub/PubSubPublishRe
 import { PubSubPublishOptions } from "../../../types/pubsub/PubSubPublishOptions.type";
 
 /**
- * Determines whether an error raised by {@link HTTPClient.execute} corresponds
- * to an HTTP 404 response. Errors are serialized as a JSON payload carrying the
- * status code, so anything that does not parse is treated as unrelated.
+ * Extracts the HTTP status code from an error raised by {@link HTTPClient.execute}.
+ * Error responses are serialized as a JSON payload carrying the status code, so
+ * an error that does not parse, such as a network failure, has none.
  */
-function isNotFoundError(error: any): boolean {
+function getHttpStatus(error: any): number | undefined {
   try {
-    return JSON.parse(error?.message).status === 404;
+    const status = JSON.parse(error?.message)?.status;
+    return typeof status === "number" ? status : undefined;
   } catch (_e: any) {
-    return false;
+    return undefined;
   }
 }
 
@@ -47,6 +48,16 @@ export default class HTTPClientPubSub implements IClientPubSub {
    * instead of paying for a failed round trip each time.
    */
   private useBulkPublishAlpha1 = false;
+
+  /**
+   * Settles once the first bulk publish on this client has completed, by which
+   * point it has found out whether the sidecar serves the stable endpoint.
+   * Calls made in the meantime wait on it rather than each probing the
+   * sidecar, so however many publishes start concurrently, a pre-1.17 sidecar
+   * normally costs one failed round trip and one warning per client. It never
+   * rejects.
+   */
+  private bulkPublishProbe?: Promise<void>;
 
   constructor(client: HTTPClient) {
     this.client = client;
@@ -120,28 +131,66 @@ export default class HTTPClientPubSub implements IClientPubSub {
    * it with a 404. A 404 is also how the sidecar reports an unknown pub/sub
    * component, so the fallback is only remembered once the alpha1 endpoint has
    * actually answered, which is the only proof that the runtime is an old one.
+   *
+   * The first call doubles as the capability probe, and calls that arrive
+   * while it is in flight wait for its outcome before sending their own batch
+   * to the selected endpoint.
    */
   private async executeBulkPublish(path: string, params: THTTPExecuteParams): Promise<object | string> {
+    if (!this.bulkPublishProbe) {
+      const probe = this.executeBulkPublishStableFirst(path, params);
+      this.bulkPublishProbe = probe.then(
+        () => undefined,
+        () => undefined,
+      );
+      return await probe;
+    }
+
+    await this.bulkPublishProbe;
+
     if (this.useBulkPublishAlpha1) {
       return await this.client.executeWithApiVersion("v1.0-alpha1", path, params);
     }
 
+    return await this.executeBulkPublishStableFirst(path, params);
+  }
+
+  private async executeBulkPublishStableFirst(path: string, params: THTTPExecuteParams): Promise<object | string> {
     try {
       return await this.client.executeWithApiVersion("v1.0", path, params);
     } catch (error: any) {
-      if (!isNotFoundError(error)) {
+      if (getHttpStatus(error) !== 404) {
         throw error;
       }
-
-      const result = await this.client.executeWithApiVersion("v1.0-alpha1", path, params);
-
-      this.logger.warn(
-        "The Dapr sidecar does not expose the stable v1.0 bulk publish endpoint, " +
-          "falling back to the deprecated v1.0-alpha1 endpoint. Upgrade to Dapr 1.17 or newer.",
-      );
-      this.useBulkPublishAlpha1 = true;
-      return result;
     }
+
+    try {
+      const result = await this.client.executeWithApiVersion("v1.0-alpha1", path, params);
+      this.fallBackToBulkPublishAlpha1();
+      return result;
+    } catch (error: any) {
+      // A sidecar that serves the stable endpoint only answers it with a 404
+      // when the component is unknown, and then answers alpha1 the same way.
+      // Any other answer, such as a 500 for a partially failed batch, means
+      // only the stable endpoint is missing.
+      const status = getHttpStatus(error);
+      if (status !== undefined && status !== 404) {
+        this.fallBackToBulkPublishAlpha1();
+      }
+      throw error;
+    }
+  }
+
+  private fallBackToBulkPublishAlpha1(): void {
+    if (this.useBulkPublishAlpha1) {
+      return;
+    }
+
+    this.useBulkPublishAlpha1 = true;
+    this.logger.warn(
+      "The Dapr sidecar does not expose the stable v1.0 bulk publish endpoint, " +
+        "falling back to the deprecated v1.0-alpha1 endpoint. Upgrade to Dapr 1.17 or newer.",
+    );
   }
 
   private async handleBulkPublishError(

@@ -14,6 +14,7 @@ limitations under the License.
 import GRPCClientPubSub from "../../../../src/implementation/Client/GRPCClient/pubsub";
 import { PublishEventRequest } from "../../../../src/proto/dapr/proto/runtime/v1/dapr_pb";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { LoggerOptions } from "../../../../src/types/logger/LoggerOptions";
 
 describe("grpc/pubsub", () => {
   describe("publish should call publishEvent with correct arguments", () => {
@@ -83,13 +84,24 @@ describe("grpc/pubsub", () => {
     const getMockClient = (
       bulkPublishEvent: (req: any) => Promise<any>,
       bulkPublishEventAlpha1: (req: any) => Promise<any>,
+      logger?: LoggerOptions,
     ) =>
       ({
-        options: { logger: undefined },
+        options: { logger },
         getClient: () => ({ bulkPublishEvent, bulkPublishEventAlpha1 }),
       } as any);
 
+    const getLogger = () => ({
+      service: { error: jest.fn(), warn: jest.fn(), info: jest.fn(), verbose: jest.fn(), debug: jest.fn() },
+    });
+
+    // Lets every pending publish run up to its first round trip to the sidecar.
+    const flushPromises = () => new Promise((resolve) => setImmediate(resolve));
+
     const messages = [{ hello: "world" }, { hello: "world 2" }];
+
+    const publishConcurrently = (pubsub: GRPCClientPubSub, count = 3) =>
+      Promise.all(Array.from({ length: count }, () => pubsub.publishBulk("my-pubsub", "my-topic", messages)));
 
     it("should call the stable bulkPublishEvent API", async () => {
       const stableRequests: any[] = [];
@@ -146,6 +158,86 @@ describe("grpc/pubsub", () => {
 
       expect(stable).toHaveBeenCalledTimes(1);
       expect(alpha1).toHaveBeenCalledTimes(2);
+    });
+
+    it("should probe the stable API once when concurrent calls fall back", async () => {
+      const logger = getLogger();
+      const stable = jest.fn(async () => {
+        throw new ConnectError("unimplemented", Code.Unimplemented);
+      });
+      const alpha1 = jest.fn(async () => ({ failedEntries: [] }));
+      const grpcClientPubsub = new GRPCClientPubSub(getMockClient(stable as any, alpha1 as any, logger));
+
+      const results = await publishConcurrently(grpcClientPubsub);
+
+      expect(results.map((res) => res.failedMessages.length)).toEqual([0, 0, 0]);
+      expect(stable).toHaveBeenCalledTimes(1);
+      expect(alpha1).toHaveBeenCalledTimes(3);
+      expect(logger.service.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("should hold concurrent calls until the first call has probed the stable API", async () => {
+      let completeProbe!: (res: any) => void;
+      const stable = jest
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              completeProbe = resolve;
+            }),
+        )
+        .mockResolvedValue({ failedEntries: [] });
+      const alpha1 = jest.fn();
+      const grpcClientPubsub = new GRPCClientPubSub(getMockClient(stable, alpha1 as any));
+
+      const pending = publishConcurrently(grpcClientPubsub);
+      await flushPromises();
+      expect(stable).toHaveBeenCalledTimes(1);
+
+      completeProbe({ failedEntries: [] });
+      const results = await pending;
+
+      expect(results.map((res) => res.failedMessages.length)).toEqual([0, 0, 0]);
+      expect(stable).toHaveBeenCalledTimes(3);
+      expect(alpha1).not.toHaveBeenCalled();
+    });
+
+    it("should not fail concurrent calls when the first call fails for another reason", async () => {
+      const stable = jest
+        .fn()
+        .mockRejectedValueOnce(new ConnectError("boom", Code.Internal))
+        .mockResolvedValue({ failedEntries: [] });
+      const alpha1 = jest.fn();
+      const grpcClientPubsub = new GRPCClientPubSub(getMockClient(stable, alpha1 as any));
+
+      const results = await publishConcurrently(grpcClientPubsub);
+
+      expect(results.map((res) => res.failedMessages.length)).toEqual([2, 0, 0]);
+      expect(stable).toHaveBeenCalledTimes(3);
+      expect(alpha1).not.toHaveBeenCalled();
+    });
+
+    it("should log the fallback warning once when several calls discover it", async () => {
+      const logger = getLogger();
+      // The first call never reaches the sidecar, so the calls waiting on it
+      // each find out for themselves that the stable API is missing.
+      const stable = jest
+        .fn()
+        .mockRejectedValueOnce(new ConnectError("connection reset", Code.Unavailable))
+        .mockRejectedValue(new ConnectError("unimplemented", Code.Unimplemented));
+      const alpha1 = jest.fn(async () => ({ failedEntries: [] }));
+      const grpcClientPubsub = new GRPCClientPubSub(getMockClient(stable, alpha1 as any, logger));
+
+      const results = await publishConcurrently(grpcClientPubsub);
+
+      expect(results.map((res) => res.failedMessages.length)).toEqual([2, 0, 0]);
+      expect(alpha1).toHaveBeenCalledTimes(2);
+      expect(logger.service.warn).toHaveBeenCalledTimes(1);
+
+      await grpcClientPubsub.publishBulk("my-pubsub", "my-topic", messages);
+
+      expect(stable).toHaveBeenCalledTimes(3);
+      expect(alpha1).toHaveBeenCalledTimes(3);
     });
 
     it("should not fall back when the stable API fails for another reason", async () => {
